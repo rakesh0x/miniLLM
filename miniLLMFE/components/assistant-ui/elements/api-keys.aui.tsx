@@ -13,6 +13,7 @@ import {
 
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { cn } from "@/lib/utils";
+import { saveChatKey } from "@/lib/chat-key-store";
 import {
   Dialog,
   DialogContent,
@@ -446,8 +447,19 @@ export function ApiKeysDialog() {
         }),
       });
       if (!res.ok) throw new Error(String(res.status));
-      const data = (await res.json()) as { plaintext_key: string };
+      const data = (await res.json()) as {
+        plaintext_key: string;
+        key: { id: number; name: string };
+      };
       setPlaintextKey(data.plaintext_key);
+      // Keep the plaintext in this browser so the chat header can bill to it;
+      // the backend only stores its hash.
+      saveChatKey({
+        id: data.key.id,
+        name: data.key.name,
+        plaintext: data.plaintext_key,
+        savedAt: Date.now(),
+      });
       setName("");
       setInitialCredits("");
       setInitialTtlDays("");

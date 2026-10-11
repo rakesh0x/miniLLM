@@ -27,5 +27,31 @@ class Settings(BaseSettings):
     default_key_credits: int = 0
     default_key_ttl_days: int = 30
 
+    # --- LLM chat (Groq Cloud) ---
+    # OpenAI-compatible upstream. Leave groq_api_key empty to disable /chat.
+    groq_api_key: str = ""
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+
+    # Fallback chain, tried in order. A model that rejects the request before
+    # any token streams (rate limit, timeout, upstream 5xx) hands the request
+    # to the next model. Once tokens are flowing a failure aborts instead, so
+    # the caller never receives a spliced-together answer.
+    llm_model_chain: str = "qwen/qwen3.8-27b,openai/gpt-oss-120b,openai/gpt-oss-20b"
+    llm_max_tokens: int = 1024
+    llm_temperature: float = 0.7
+    llm_timeout_seconds: float = 60.0
+    # Metering: credits charged per 1K tokens the provider reports. A chat
+    # reserves an upper bound before streaming, then settles the exact cost.
+    credits_per_1k_tokens: int = 1
+    # Context bounds, so one request cannot meter an unbounded prompt.
+    llm_max_history_messages: int = 50
+    llm_max_message_chars: int = 8000
+    llm_system_prompt: str = ""
+
+    @property
+    def model_chain(self) -> list[str]:
+        """The fallback chain, empty entries removed."""
+        return [m.strip() for m in self.llm_model_chain.split(",") if m.strip()]
+
 
 settings = Settings()

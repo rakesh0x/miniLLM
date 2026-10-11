@@ -262,6 +262,10 @@ def main() -> int:
         )
         session.commit()
         reclaimed = credits_service.reclaim_expired(session)
+        # reclaim_expired runs inside the caller's transaction by design (so a
+        # later reserve in the same call sees the credits); commit here or the
+        # settlement rolls back and leaks a pending row for the next run.
+        session.commit()
         check("one reservation reclaimed", reclaimed == 1, str(reclaimed))
         b = service_balance(session, race_key["id"])
         check("reclaim returns credit to available", (b.reserved, b.spent) == (0, 27), str(b))

@@ -133,6 +133,7 @@ def _settle(
     new_status: str,
     *,
     reference: str | None = None,
+    amount: int | None = None,
 ) -> dict[str, int] | None:
     """Settle a reservation exactly once, atomically.
 
@@ -140,6 +141,11 @@ def _settle(
     in `pending`, so a duplicate commit or release is a no-op rather than a
     double charge. The key-side write happens in the same transaction, so a
     failure there rolls the whole settlement back.
+
+    `amount` (commit only) settles part of the reservation — used by metered
+    streaming work that reserves an upper bound up front and pays for what it
+    actually consumed. The remainder moves straight back to the available pool
+    in the same transaction, and both movements are ledgered.
     """
     transition = (
         update(CreditReservation)
@@ -157,19 +163,54 @@ def _settle(
         # Already settled (or gone) — idempotent no-op.
         return None
 
-    key_id, amount = row.api_key_id, row.amount
+    key_id, reserved_amount = row.api_key_id, row.amount
     settled_reference = reference or row.reference
 
+    if new_status == COMMITTED and amount is not None:
+        if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+            raise HTTPException(
+                status_code=422, detail="settle amount must be a positive integer"
+            )
+        if amount > reserved_amount:
+            raise HTTPException(
+                status_code=422,
+                detail=f"cannot settle {amount} of a {reserved_amount}-credit reservation",
+            )
+        effective, remainder = amount, reserved_amount - amount
+    else:
+        effective, remainder = reserved_amount, 0
+
     if new_status == COMMITTED:
+        if remainder:
+            # Return the unspent part of the reservation to available first, so
+            # each ledger row carries a truthful `available_after`.
+            released = session.execute(
+                _returning_balances(
+                    update(ApiKey)
+                    .where(ApiKey.id == key_id)
+                    .where(ApiKey.credits_reserved >= reserved_amount)
+                    .values(credits_reserved=ApiKey.credits_reserved - remainder)
+                )
+            ).first()
+            if released is None:
+                session.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Reservation {reservation.id} is out of sync with the balance",
+                )
+            _append_ledger(
+                session, key_id, KIND_RELEASE, remainder, released, settled_reference
+            )
+
         # reserved -> spent. available is unchanged: both buckets are already
         # excluded from the available total.
         key_update = (
             update(ApiKey)
             .where(ApiKey.id == key_id)
-            .where(ApiKey.credits_reserved >= amount)
+            .where(ApiKey.credits_reserved >= effective)
             .values(
-                credits_reserved=ApiKey.credits_reserved - amount,
-                credits_spent=ApiKey.credits_spent + amount,
+                credits_reserved=ApiKey.credits_reserved - effective,
+                credits_spent=ApiKey.credits_spent + effective,
             )
         )
     else:
@@ -177,8 +218,8 @@ def _settle(
         key_update = (
             update(ApiKey)
             .where(ApiKey.id == key_id)
-            .where(ApiKey.credits_reserved >= amount)
-            .values(credits_reserved=ApiKey.credits_reserved - amount)
+            .where(ApiKey.credits_reserved >= reserved_amount)
+            .values(credits_reserved=ApiKey.credits_reserved - reserved_amount)
         )
 
     balance = session.execute(_returning_balances(key_update)).first()
@@ -191,24 +232,40 @@ def _settle(
             detail=f"Reservation {reservation.id} is out of sync with the balance",
         )
 
-    available_after = (
-        balance.credits_allocated - balance.credits_spent - balance.credits_reserved
-    )
-    session.add(
-        CreditLedger(
-            api_key_id=key_id,
-            kind=new_status,
-            amount=amount,
-            available_after=available_after,
-            reference=settled_reference,
-        )
-    )
+    kind = KIND_COMMIT if new_status == COMMITTED else new_status
+    _append_ledger(session, key_id, kind, effective, balance, settled_reference)
     return {
         "allocated": balance.credits_allocated,
         "spent": balance.credits_spent,
         "reserved": balance.credits_reserved,
-        "available": available_after,
+        "available": _available_of(balance),
     }
+
+
+def _available_of(balance) -> int:
+    return (
+        balance.credits_allocated - balance.credits_spent - balance.credits_reserved
+    )
+
+
+def _append_ledger(
+    session: Session,
+    key_id: int,
+    kind: str,
+    amount: int,
+    balance,
+    reference: str | None,
+) -> None:
+    """Append one movement to the ledger from a RETURNING balance row."""
+    session.add(
+        CreditLedger(
+            api_key_id=key_id,
+            kind=kind,
+            amount=amount,
+            available_after=_available_of(balance),
+            reference=reference,
+        )
+    )
 
 
 def allocate(
@@ -362,16 +419,24 @@ def reserve(
     return reservation.id
 
 
-def commit(session: Session, *, reservation_id: int, reference: str | None = None) -> bool:
+def commit(
+    session: Session,
+    *,
+    reservation_id: int,
+    reference: str | None = None,
+    amount: int | None = None,
+) -> bool:
     """Convert a reservation into spent credits.
 
     Returns False when the reservation was already settled, so a retried commit
-    cannot double-charge.
+    cannot double-charge. Pass `amount` to settle only part of the reservation
+    (the remainder returns to available in the same transaction) — used by
+    metered streaming work that reserves an upper bound up front.
     """
     reservation = session.get(CreditReservation, reservation_id)
     if reservation is None:
         raise ReservationNotFound()
-    settled = _settle(session, reservation, COMMITTED, reference=reference)
+    settled = _settle(session, reservation, COMMITTED, reference=reference, amount=amount)
     session.commit()
     return settled is not None
 

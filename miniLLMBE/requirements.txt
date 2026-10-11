@@ -3,3 +3,5 @@ uvicorn[standard]>=0.32
 sqlmodel>=0.0.22
 pydantic-settings>=2.6
 psycopg[binary]>=3.2
+# streaming chat client (Groq's OpenAI-compatible API) + verification suites
+httpx>=0.27

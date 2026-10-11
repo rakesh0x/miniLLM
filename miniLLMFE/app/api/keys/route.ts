@@ -18,6 +18,6 @@ export async function GET() {
 }
 
 export async function POST(req: Request) {
-  const { name } = await req.json();
-  return proxy("/keys", { method: "POST", body: JSON.stringify({ name }) });
+  const body = await req.json();
+  return proxy("/keys", { method: "POST", body: JSON.stringify(body) });
 }

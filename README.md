@@ -101,6 +101,52 @@ except Exception:
 `POST /usage/record` is a documented example of a guarded, credit-charging
 endpoint.
 
+### Chat
+
+`POST /chat` is the metered streaming endpoint — the case `charge` cannot
+express, because the cost is only known when the stream ends.
+
+```
+browser -> /api/chat (Next passthrough) -> POST /chat -> Groq Cloud -> back
+```
+
+1. **Reserve an upper bound.** The prompt is bounded by a token estimate and
+   the completion by `LLM_MAX_TOKENS`, so the reservation always covers what
+   the provider can bill. While held, no concurrent request can spend those
+   credits.
+2. **Prime the upstream.** No bytes are sent to the client until the model has
+   produced text, so an exhausted model chain is an honest `429`/`503` rather
+   than a half-written answer.
+3. **Settle the exact cost.** The usage the provider reports in its final
+   chunk becomes the charge; the unused part of the reservation returns to the
+   available pool in the same transaction. When the provider reports no usage,
+   the charge falls back to an estimate.
+4. **Clean up no matter what.** A failure, or a client that hangs up
+   mid-stream, charges an estimate of what was delivered — or releases the
+   reservation when nothing was.
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/chat \
+  -H "Authorization: Bearer <your-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"hi"}]}'
+```
+
+The response is the AI SDK v7 UI-message stream (`start`, `text-start`,
+`text-delta`, `text-end`, `finish`, `[DONE]`) — the format
+`AssistantChatTransport` already parses, so the Next route only carries bytes.
+
+**Fallback.** `LLM_MODEL_CHAIN` lists models in the order to try
+(`qwen/qwen3-32b,openai/gpt-oss-120b,openai/gpt-oss-20b` by default). A model
+that refuses a request *before any token streams* — rate limit, timeout,
+upstream 5xx — hands the request to the next model. Once tokens are flowing a
+failure aborts instead, because splicing two models' answers would corrupt the
+message. The ledger records which model served each request
+(`chat:<model>`).
+
+**Metering.** `CREDITS_PER_1K_TOKENS` credits per 1K tokens the provider
+reports (prompt + completion), rounded up, minimum 1.
+
 ### Endpoints
 
 | Method | Path | Notes |
@@ -113,6 +159,7 @@ endpoint.
 | `POST` | `/keys/{id}/credits/spend` | Immediate spend (`{amount, reference?}`) |
 | `GET` | `/keys/{id}/credits/ledger` | Movement history, newest first |
 | `POST` | `/usage/record` | Metered demo; `Authorization: Bearer <key>` |
+| `POST` | `/chat` | Metered streaming chat (SSE); `Authorization: Bearer <key>` |
 | `POST` | `/credits/reclaim-expired` | Release expired reservations |
 
 Auth: `Authorization: Bearer <api-key>` → `401` invalid/revoked,
@@ -125,17 +172,31 @@ The chat sidebar's **API keys** entry opens the management dialog: create a key
 key to see its balance, expiry, a top-up form, a one-credit spend button, and
 its ledger.
 
+The chat header has an **API key picker** (`ChatKeyPicker`): it lists the keys
+this browser has opted into — saved when a key is created in the dialog, or
+pasted — with each key's live balance, and sends the selected key as the bearer
+token on every message. With no key selected, chat requests are rejected with
+`401`.
+
 ## Verifying
 
 ```bash
 .venv/bin/python -m uvicorn miniLLMBE.main:app &      # backend on :8000
 .venv/bin/python scripts/verify_credits.py             # 57 checks
+.venv/bin/python scripts/verify_chat.py                # 48 checks
 ```
 
-The suite covers the balance invariant, TTL expiry and revival, overspend
-rejection, the ledger, reserve/commit/release, TTL reclaim, double-settle
-idempotency, the bearer guard, revocation, and a **40-thread concurrency race**
-that must land exactly its last credit — the atomicity proof.
+The credit suite covers the balance invariant, TTL expiry and revival,
+overspend rejection, the ledger, reserve/commit/release, TTL reclaim,
+double-settle idempotency, the bearer guard, revocation, and a **40-thread
+concurrency race** that must land exactly its last credit — the atomicity proof.
+
+`verify_chat.py` needs no API key and no network: it runs the backend against
+a **stub Groq** that rate-limits the first model in the chain and serves the
+second. It covers the stream shape, fallback across the chain, exact token
+metering, partial settlement of the reservation, estimated usage when the
+provider reports none, the rejection paths (402/403/401/422), a fully
+rate-limited chain, a client hanging up mid-stream, and chat disabled.
 
 ## Migration note
 
@@ -146,8 +207,15 @@ Adding Alembic is the natural next step.
 
 ## Known gaps
 
-- The frontend proxies `/api/chat` to `POST /chat`, which does not exist yet.
+- The chat UI keeps the plaintext keys you opt into in **browser
+  localStorage** (`lib/chat-key-store.ts`). The backend only stores a hash, so
+  the alternative is pasting a key on every message. Keys stay in your browser;
+  they are sent only as the `Authorization` header on chat requests.
+- Chat streams **text only**. Image/file attachments and tool calls in the
+  composer are dropped before the request reaches the model.
 - The `/keys` endpoints are unauthenticated — they assume a trusted operator.
-  Only the metered `/usage/record` path enforces a bearer token.
+  Only the metered `/usage/record` and `/chat` paths enforce a bearer token.
 - `verify_key` does a read plus a `last_used_at` write on every call; fine at
   this scale, worth batching if it becomes hot.
+- Mid-stream failures charge an **estimated** cost, since the provider never
+  reported final usage for a stream that died.
