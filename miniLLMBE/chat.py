@@ -100,9 +100,42 @@ def _release(reservation_id: int) -> None:
 
 
 def _bypass_cache(request: Request) -> bool:
-    """A client can opt out with `Cache-Control: no-cache` (or `no-store`)."""
+    """Whether this request opts out of the cache.
+
+    Opt-out is the header a *browser or SDK* sets deliberately:
+    `Cache-Control: no-cache` / `no-store`, or the legacy `Pragma: no-cache`.
+
+    Hop-by-hop intermediaries are excluded, and this matters in practice. The
+    Next.js frontend proxies with `cache: "no-store"` to stop Vercel and nginx
+    buffering or storing a response, and undici translates that into
+    `Cache-Control: no-cache` + `Pragma: no-cache` on the *upstream* request.
+    Treating those as an opt-out silently disabled the cache for every request
+    that arrived through the deployed frontend, while direct API calls still
+    hit it — a bug that only appears in the deployed topology.
+
+    So: an opt-out from a recognised proxy (`x-vercel-*`, or our own
+    `x-minillm-proxy`) is ignored, and `Pragma` counts only when the request
+    did not come through one.
+    """
+    if _via_proxy(request):
+        return False
     header = (request.headers.get("cache-control") or "").lower()
-    return "no-cache" in header or "no-store" in header
+    if "no-cache" in header or "no-store" in header:
+        return True
+    return "no-cache" in (request.headers.get("pragma") or "").lower()
+
+
+def _via_proxy(request: Request) -> bool:
+    """True when the request was forwarded by the miniLLM frontend.
+
+    The frontend tags its own proxied calls, so this stays correct even if a
+    CDN or platform rewrites the header names.
+    """
+    if request.headers.get("x-minillm-proxy"):
+        return True
+    return any(
+        name.lower().startswith("x-vercel-") for name in request.headers.keys()
+    )
 
 
 def hit_charge(entry: ResponseCache) -> int:

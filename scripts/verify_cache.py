@@ -10,7 +10,9 @@ Cache coverage:
   3.  expiry: an entry past its TTL is invisible and re-fetched
   4.  isolation: a second key never sees the first key's entry, even with an
       identical prompt
-  5.  bypass: `Cache-Control: no-cache` skips lookup and re-fetches
+  5.  bypass: `Cache-Control: no-cache` skips lookup and re-fetches, but the
+      opt-out headers the frontend proxy unavoidably sends are NOT treated as a
+      client opt-out (regression: this silently disabled caching in production)
   6.  billing: a hit charges the recorded cost; an unaffordable key gets 402;
       the ledger reconciles to the balance
   7.  failed generations are never cached, and re-fetch on the next request
@@ -197,11 +199,19 @@ def chat(
     text: str = "What is the answer?",
     *,
     bypass: bool = False,
+    via_proxy: bool = False,
     timeout: float = 30,
 ) -> httpx.Response:
     headers = {"Authorization": f"Bearer {key}"}
     if bypass:
         headers["Cache-Control"] = "no-cache"
+    if via_proxy:
+        # What the Next.js frontend actually sends: `cache: "no-store"` in its
+        # fetch makes undici emit these opt-out headers upstream, plus the tag
+        # the backend uses to tell a proxy from a real client.
+        headers["Cache-Control"] = "no-cache"
+        headers["Pragma"] = "no-cache"
+        headers["X-MiniLLM-Proxy"] = "1"
     return httpx.post(
         f"{BASE}/chat",
         json={"messages": [{"role": "user", "content": text}]},
@@ -374,6 +384,34 @@ def check_bypass() -> None:
     check("bypassed request returns 200", response.status_code == 200)
     check("bypassed request re-fetched from upstream", calls_for(MODEL_B) == 1)
     check("bypassed request returns fresh content", text_from(parse_sse(response.text)) == "fresh")
+
+    # Regression: the deployed frontend proxies with `cache: "no-store"`, which
+    # makes the fetch implementation send Cache-Control: no-cache upstream.
+    # Reading that as a client opt-out silently disabled the cache for every
+    # request arriving through the frontend while direct calls still hit it —
+    # a bug that only appears in the deployed topology.
+    script_model(MODEL_A, status=429)
+    script_model(MODEL_B, deltas=["proxied"], usage=USAGE_DEFAULT)
+    clear_calls()
+
+    proxied_key = create_key("cache-via-proxy", credits=50, ttl_days=1)
+    chat(proxied_key["plaintext_key"], "Proxy path question", via_proxy=True)
+    check(
+        "proxied request stores a response",
+        calls_for(MODEL_B) == 1,
+    )
+    clear_calls()
+
+    replay = chat(proxied_key["plaintext_key"], "Proxy path question", via_proxy=True)
+    check("proxied repeat returns 200", replay.status_code == 200)
+    check(
+        "proxied repeat is served from cache (no upstream call)",
+        calls_for(MODEL_B) == 0,
+    )
+    check(
+        "proxied repeat replays the stored answer",
+        text_from(parse_sse(replay.text)) == "proxied",
+    )
 
 
 def check_expiry() -> None:

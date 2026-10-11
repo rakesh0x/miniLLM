@@ -1,8 +1,11 @@
-export async function DELETE(_: Request, { params }: { params: Promise<{ id: string }> }) {
+import { callBackend } from "@/lib/backend";
+
+export const dynamic = "force-dynamic";
+
+type Ctx = { params: Promise<{ id: string }> };
+
+export async function DELETE(_: Request, { params }: Ctx) {
   const { id } = await params;
-  const res = await fetch(`${process.env.BACKEND_URL ?? "http://127.0.0.1:8000"}/keys/${id}`, {
-    method: "DELETE",
-    cache: "no-store",
-  });
+  const res = await callBackend(`/keys/${id}`, { method: "DELETE" });
   return new Response(null, { status: res.ok ? 204 : res.status });
 }

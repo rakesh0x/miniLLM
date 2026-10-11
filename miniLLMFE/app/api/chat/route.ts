@@ -1,6 +1,6 @@
-export const dynamic = "force-dynamic";
+import { callBackend } from "@/lib/backend";
 
-const BACKEND = process.env.BACKEND_URL ?? "http://127.0.0.1:8000";
+export const dynamic = "force-dynamic";
 
 /**
  * Passthrough to the backend's metered chat endpoint.
@@ -9,19 +9,16 @@ const BACKEND = process.env.BACKEND_URL ?? "http://127.0.0.1:8000";
  * the backend streams the AI SDK v7 UI-message stream straight back, so this
  * route only carries bytes, status and headers — nothing is parsed or
  * re-shaped here.
+ *
+ * The response body is streamed rather than buffered. `fetch` resolves as soon
+ * as the headers arrive, so the first token reaches the browser while the model
+ * is still generating.
  */
 export async function POST(req: Request) {
   const authorization = req.headers.get("authorization");
-
   const body = await req.text();
 
-  if (!authorization) {
-    console.log("Auth headers missing")
-  } else {
-    console.log("Auth headers in present")
-  }
-
-  const res = await fetch(`${BACKEND}/chat`, {
+  const res = await callBackend("/chat", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -29,12 +26,12 @@ export async function POST(req: Request) {
       ...(authorization ? { authorization } : {}),
     },
     body,
-    cache: "no-store",
   });
 
   if (!res.ok || !res.body) {
     // Failures before the first token (402/403/429/503) arrive as JSON with a
-    // real status, which is what surfaces the error in the chat UI.
+    // real status, which is what surfaces the error in the chat UI. An
+    // unreachable backend arrives here as the 503 from callBackend().
     const detail = await res.text().catch(() => "");
     return new Response(detail || JSON.stringify({ detail: "upstream error" }), {
       status: res.status,
@@ -47,6 +44,7 @@ export async function POST(req: Request) {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
+      // Tells nginx and Vercel not to buffer, which would defeat streaming.
       "X-Accel-Buffering": "no",
       "X-Vercel-AI-UI-Message-Stream": res.headers.get("X-Vercel-AI-UI-Message-Stream") ?? "v1",
     },
