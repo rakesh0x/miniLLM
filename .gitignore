@@ -5,3 +5,5 @@
 # Python bytecode should never be tracked
 __pycache__/
 *.pyc
+minillm.db
+render.yaml
