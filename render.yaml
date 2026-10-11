@@ -1,0 +1,91 @@
+# Render blueprint for the miniLLM backend (FastAPI).
+#
+# Apply from the Render dashboard:  New -> Blueprint -> point at this repo.
+# Every secret below is `sync: false`, so Render prompts you to paste the real
+# value. Nothing secret is ever committed here.
+#
+# After the first deploy, set BACKEND_URL to this service's public URL on the
+# Vercel frontend project, and add https://<frontend>.vercel.app to
+# CORS_ORIGINS below.
+
+services:
+  - type: web
+    name: minillm-api
+    runtime: python
+    plan: starter # 'free' sleeps after 15 min idle and caps at 100 req/min,
+                  # which throttles streamed chat; 'starter' keeps it warm.
+    buildCommand: pip install -r miniLLMBE/requirements.txt
+    startCommand: uvicorn miniLLMBE.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # Pin the runtime: Render's default Python has moved before, and a move
+      # can break a build that was green yesterday. 3.12 is what the app is
+      # tested against.
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+
+      # --- required ---
+      # Use the POOLED endpoint (`-pooler` in the hostname). Each request
+      # issues several statements, so region dominates latency:
+      #   ap-southeast-1  96ms/query     us-east-2  280ms/query
+      # Verify with:  python scripts/bench_db.py "<dsn>"
+      - key: DATABASE_URL
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+
+      # --- CORS ---
+      # Comma-separated. Must include the frontend's public origin.
+      - key: CORS_ORIGINS
+        value: http://localhost:3000
+
+      # --- pool ---
+      # Keep pool_size + max_overflow modest: the free/starter plan runs one
+      # instance, and Neon's connection allowance is the real ceiling.
+      - key: DB_POOL_SIZE
+        value: "5"
+      - key: DB_MAX_OVERFLOW
+        value: "5"
+
+      # --- metering ---
+      - key: CREDITS_PER_1K_TOKENS
+        value: "1"
+      - key: CREDIT_TTL_DAYS
+        value: "30"
+      - key: DEFAULT_KEY_CREDITS
+        value: "0"
+      - key: DEFAULT_KEY_TTL_DAYS
+        value: "30"
+
+      # --- model chain ---
+      # Must match a chain that exists at your provider. A model that is
+      # removed upstream will fail every request until this is updated.
+      - key: LLM_MODEL_CHAIN
+        value: qwen/qwen3.8-27b,openai/gpt-oss-120b,openai/gpt-oss-20b
+      - key: LLM_MAX_TOKENS
+        value: "1024"
+      - key: LLM_TIMEOUT_SECONDS
+        value: "60"
+
+      # --- cache ---
+      # 'key' keeps cached answers private per API key. Do not switch to
+      # 'global' unless prompts carry no user-specific data.
+      - key: CACHE_ENABLED
+        value: "true"
+      - key: CACHE_SCOPE
+        value: key
+      - key: CACHE_HIT_MODE
+        value: metered
+      - key: CACHE_TTL_SECONDS
+        value: "86400"
+      - key: CACHE_EVICT_EVERY
+        value: "100"
+
+      # --- guardrails ---
+      # Both layers stay on. Turning off the filter lets the model disclose
+      # credentials or its own identity.
+      - key: GUARDRAIL_PERSONA
+        value: "true"
+      - key: GUARDRAIL_FILTER_OUTPUT
+        value: "true"

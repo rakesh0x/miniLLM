@@ -23,20 +23,25 @@ from fastapi import Depends, Header, HTTPException
 from sqlmodel import Session
 
 from .config import settings
-from .db import get_session
+from .db import Session as DBSession
+from .db import engine
 from .errors import CreditsExpired, InsufficientCredits
 from .keys import verify_key
 from .models import ApiKey
 
 
-def get_api_key(
-    session: Session = Depends(get_session),
-    authorization: str | None = Header(default=None),
-) -> ApiKey:
+def get_api_key(authorization: str | None = Header(default=None)) -> ApiKey:
     """Resolve the caller's API key from `Authorization: Bearer <key>`.
 
-    `verify_key` also stamps `last_used_at`, so any authenticated call counts
-    as usage even before credits are charged.
+    The session is opened and closed *inside* this function on purpose. As a
+    yield-dependency it would be held until the response finished — and for
+    `POST /chat` that means the whole streamed generation. Since concurrency is
+    bounded by the connection pool, one connection pinned per in-flight request
+    halves the number of requests the gateway can serve, and on a slow database
+    the pool becomes the throughput limit.
+
+    `verify_key` also stamps `last_used_at`, so any authenticated call counts as
+    usage even before credits are charged.
     """
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -48,9 +53,13 @@ def get_api_key(
             detail="Expected 'Authorization: Bearer <api-key>'",
         )
 
-    record = verify_key(session, token.strip())
+    with DBSession(engine, expire_on_commit=False) as session:
+        record = verify_key(session, token.strip())
     if record is None:
         raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+    # Safe to hand out: `expire_on_commit=False` means the commit inside
+    # `verify_key` leaves the attributes loaded, so reading them off the
+    # detached instance cannot need a refresh on a closed session.
     return record
 
 

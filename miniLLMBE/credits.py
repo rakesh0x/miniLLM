@@ -48,6 +48,30 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# Last time a per-key reclaim sweep ran, keyed by api_key_id. In-process and
+# approximate by design: the sweep only needs to happen occasionally, and a
+# shared record would cost the round trip it is meant to avoid.
+_reclaim_state: dict[int, datetime] = {}
+
+
+def _reclaim_due(key_id: int, now: datetime | None = None) -> bool:
+    """True when this key's reclaim sweep should run now.
+
+    Bounded by `reservation_reclaim_interval_seconds`. Sweeping more often
+    cannot free anything extra — a reservation is only reclaimable once its TTL
+    has elapsed — so the only effect is more queries per request.
+    """
+    interval = settings.reservation_reclaim_interval_seconds
+    if interval <= 0:
+        return True
+    now = now or _now()
+    last = _reclaim_state.get(key_id)
+    if last is not None and (now - last).total_seconds() < interval:
+        return False
+    _reclaim_state[key_id] = now
+    return True
+
+
 def _available_expression():
     """SQL for `available` — used inside WHERE clauses so the check and the
     write happen in one statement."""
@@ -181,35 +205,21 @@ def _settle(
         effective, remainder = reserved_amount, 0
 
     if new_status == COMMITTED:
-        if remainder:
-            # Return the unspent part of the reservation to available first, so
-            # each ledger row carries a truthful `available_after`.
-            released = session.execute(
-                _returning_balances(
-                    update(ApiKey)
-                    .where(ApiKey.id == key_id)
-                    .where(ApiKey.credits_reserved >= reserved_amount)
-                    .values(credits_reserved=ApiKey.credits_reserved - remainder)
-                )
-            ).first()
-            if released is None:
-                session.rollback()
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Reservation {reservation.id} is out of sync with the balance",
-                )
-            _append_ledger(
-                session, key_id, KIND_RELEASE, remainder, released, settled_reference
-            )
-
-        # reserved -> spent. available is unchanged: both buckets are already
-        # excluded from the available total.
+        # One statement for both halves of a partial settle: moving the
+        # remainder back to available and the effective part to spent are a
+        # single logical mutation, and one round trip keeps the row lock for
+        # half as long — which matters on a remote database.
+        #
+        # `available` is unchanged by the commit half (reserved and spent both
+        # move), so the two ledger rows are derived from the one RETURNING:
+        # the release row adds the remainder back, the commit row sees the
+        # settled balance.
         key_update = (
             update(ApiKey)
             .where(ApiKey.id == key_id)
-            .where(ApiKey.credits_reserved >= effective)
+            .where(ApiKey.credits_reserved >= reserved_amount)
             .values(
-                credits_reserved=ApiKey.credits_reserved - effective,
+                credits_reserved=ApiKey.credits_reserved - reserved_amount,
                 credits_spent=ApiKey.credits_spent + effective,
             )
         )
@@ -232,40 +242,47 @@ def _settle(
             detail=f"Reservation {reservation.id} is out of sync with the balance",
         )
 
-    kind = KIND_COMMIT if new_status == COMMITTED else new_status
-    _append_ledger(session, key_id, kind, effective, balance, settled_reference)
+    available = _available_of(balance)
+    if new_status == COMMITTED:
+        if remainder:
+            session.add(
+                CreditLedger(
+                    api_key_id=key_id,
+                    kind=KIND_RELEASE,
+                    amount=remainder,
+                    available_after=available + remainder,
+                    reference=settled_reference,
+                )
+            )
+        session.add(
+            CreditLedger(
+                api_key_id=key_id,
+                kind=KIND_COMMIT,
+                amount=effective,
+                available_after=available,
+                reference=settled_reference,
+            )
+        )
+    else:
+        session.add(
+            CreditLedger(
+                api_key_id=key_id,
+                kind=new_status,
+                amount=effective,
+                available_after=available,
+                reference=settled_reference,
+            )
+        )
     return {
         "allocated": balance.credits_allocated,
         "spent": balance.credits_spent,
         "reserved": balance.credits_reserved,
-        "available": _available_of(balance),
+        "available": available,
     }
 
 
 def _available_of(balance) -> int:
-    return (
-        balance.credits_allocated - balance.credits_spent - balance.credits_reserved
-    )
-
-
-def _append_ledger(
-    session: Session,
-    key_id: int,
-    kind: str,
-    amount: int,
-    balance,
-    reference: str | None,
-) -> None:
-    """Append one movement to the ledger from a RETURNING balance row."""
-    session.add(
-        CreditLedger(
-            api_key_id=key_id,
-            kind=kind,
-            amount=amount,
-            available_after=_available_of(balance),
-            reference=reference,
-        )
-    )
+    return balance.credits_allocated - balance.credits_spent - balance.credits_reserved
 
 
 def allocate(
@@ -374,10 +391,15 @@ def reserve(
     """Hold credits for work in progress. Returns the reservation id.
 
     Reclaims this key's expired reservations first so credits are never locked
-    away permanently by a caller that never committed.
+    away permanently by a caller that never committed. The sweep is throttled
+    per process (see `_reclaim_due`): it costs a round trip, and reservations
+    only strand for at most `reservation_ttl_seconds` anyway, so running it on
+    every reserve buys nothing while slowing every request down.
     """
     _check_amount(amount)
-    reclaim_expired(session, key_id=key_id)
+
+    if _reclaim_due(key_id):
+        reclaim_expired(session, key_id=key_id)
 
     ttl = settings.reservation_ttl_seconds if ttl_seconds is None else ttl_seconds
     expires_at = _now() + timedelta(seconds=max(1, ttl))

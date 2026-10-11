@@ -1,6 +1,6 @@
 import hashlib
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlmodel import Session, select
 
@@ -50,12 +50,24 @@ def create_api_key(
 
 
 def verify_key(session: Session, raw_key: str) -> ApiKey | None:
+    """Resolve a key by its hash, stamping when it was last used.
+
+    The stamp is stale-tolerant: it is rewritten only when the recorded value is
+    older than `last_used_stamp_seconds`. Each round trip to a remote database
+    costs a few hundred milliseconds, so a write on every authenticated call
+    turns one round trip into three. The value stays accurate to within the
+    window, which is all "last used" is for.
+    """
     record = session.exec(
         select(ApiKey).where(ApiKey.key_hash == hash_key(raw_key))
     ).first()
     if record is None or record.revoked_at is not None:
         return None
-    record.last_used_at = datetime.now(timezone.utc)
-    session.add(record)
-    session.commit()
+
+    now = datetime.now(timezone.utc)
+    last = record.last_used_at
+    if last is None or (now - last) > timedelta(seconds=settings.last_used_stamp_seconds):
+        record.last_used_at = now
+        session.add(record)
+        session.commit()
     return record

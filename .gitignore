@@ -1,3 +1,7 @@
 .agent-logs/
 .minillm.db/
 .env
+
+# Python bytecode should never be tracked
+__pycache__/
+*.pyc

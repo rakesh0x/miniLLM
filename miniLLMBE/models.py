@@ -85,3 +85,35 @@ class CreditReservation(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow)
     expires_at: datetime
     settled_at: datetime | None = None
+
+
+class ResponseCache(SQLModel, table=True):
+    """A completed chat answer, keyed by a hash of the request that produced it.
+
+    The key covers everything that determines the answer — scope, model,
+    system prompt, generation parameters, and the *entire* canonical message
+    list — so a hit is only ever returned for a request that is equivalent to
+    the one that produced it. Scoping the hash by `api_key_id` (the default)
+    keeps one key's answers invisible to another.
+
+    `query_hash` is unique: the scope is folded into the hash, not just the
+    column, so identical prompts from two keys cannot collide.
+    """
+
+    __tablename__ = "response_cache"
+
+    id: int | None = Field(default=None, primary_key=True)
+    query_hash: str = Field(unique=True, max_length=64)
+    api_key_id: int = Field(index=True)
+    model: str = Field(max_length=100)
+    response_text: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    # The cost this answer was billed at, replayed on a hit so billing stays
+    # identical whether the answer is fresh or cached.
+    credits_charged: int = 0
+    hit_count: int = Field(default=0)
+    created_at: datetime = Field(default_factory=_utcnow)
+    last_hit_at: datetime | None = Field(default=None, index=True)
+    expires_at: datetime = Field(index=True)

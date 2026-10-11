@@ -1,27 +1,68 @@
 # miniLLM
 
-A self-hosted LLM app: a Next.js frontend and a FastAPI backend where **every
-API key carries its own credit balance with a TTL**, enforced atomically in
-Postgres.
+A self-hosted LLM gateway: a Next.js frontend and a FastAPI backend where
+**every API key carries its own credit balance with a TTL**, metered on real
+token usage, enforced atomically in Postgres.
 
 ```
 miniLLMFE/   Next.js 16 (App Router) chat UI + API-key management dialog
-miniLLMBE/   FastAPI service: keys, credits, bearer auth, usage
-scripts/     verification suites
+miniLLMBE/   FastAPI service: keys, credits, bearer auth, chat, cache, guardrails
+scripts/     verification suites + a database benchmark
 ```
+
+## Architecture
+
+```
+browser ──► miniLLMFE (Next.js)  ──► /api/*  passthrough
+                                        │
+                                        ▼
+                                miniLLMBE (FastAPI)
+                                   │            │
+                                   │            └──► cache (exact-match, Postgres)
+                                   │
+                     credit gate ──┤──► reserve ──► stream ──► settle
+                                   │
+                                   ▼
+                            Groq Cloud (SSE)
+                                   │
+                                   └──► OutputFilter ──► AI SDK v7 SSE ──► browser
+```
+
+Two independent guarantees, and they compose:
+
+- **Credits** (`miniLLMBE/credits.py`) — the balance invariant is checked and
+  written in a single SQL statement, so two concurrent requests can never both
+  spend the same last credit.
+- **Cache** (`miniLLMBE/cache.py`) — a hit replays a stored answer *and its
+  original charge*, so billing is identical to a fresh request and only the
+  upstream call is skipped.
 
 ## Running
 
 ```bash
-# backend (expects Postgres; see DATABASE_URL in .env)
+# backend (expects Postgres; see DATABASE_URL in miniLLMBE/.env)
 .venv/bin/python -m uvicorn miniLLMBE.main:app          # :8000
 
 # frontend
 cd miniLLMFE && npm run dev                             # :3000
 ```
 
-`miniLLMBE/.env.example` documents every setting. Postgres settings can be
-tuned through `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` / `DB_POOL_RECYCLE`.
+`miniLLMBE/.env.example` documents every setting, with the reasoning for the
+ones that matter. `miniLLMFE/.env.example` covers the frontend.
+
+### Where to put the database
+
+Database latency is multiplied by the ~8 statements a chat request issues, so
+region choice is the single biggest lever on time-to-first-token:
+
+| region | median query | 12 concurrent chats |
+|---|---|---|
+| `ap-southeast-1` (Singapore) | 96ms | 6.4s |
+| `us-east-2` (Ohio) | 280ms | 25s |
+| local Postgres | 0.1ms | 0.1s |
+
+Use the **pooled** endpoint (`-pooler` in the hostname) and check yours any
+time: `scripts/bench_db.py "<dsn>"`.
 
 ## Credits
 
@@ -137,7 +178,7 @@ The response is the AI SDK v7 UI-message stream (`start`, `text-start`,
 `AssistantChatTransport` already parses, so the Next route only carries bytes.
 
 **Fallback.** `LLM_MODEL_CHAIN` lists models in the order to try
-(`qwen/qwen3-32b,openai/gpt-oss-120b,openai/gpt-oss-20b` by default). A model
+(`qwen/qwen3.8-27b`, `openai/gpt-oss-120b`, `openai/gpt-oss-20b` by default). A model
 that refuses a request *before any token streams* — rate limit, timeout,
 upstream 5xx — hands the request to the next model. Once tokens are flowing a
 failure aborts instead, because splicing two models' answers would corrupt the
@@ -146,6 +187,57 @@ message. The ledger records which model served each request
 
 **Metering.** `CREDITS_PER_1K_TOKENS` credits per 1K tokens the provider
 reports (prompt + completion), rounded up, minimum 1.
+
+### Response cache
+
+A completed answer is stored under a hash of everything that determines it —
+scope, model, generation parameters, and the **entire** canonical message list.
+On a hit the answer is replayed with the same frames a live stream produces, so
+the client cannot tell the difference.
+
+```
+miss:  reserve -> stream -> settle exact usage -> store
+hit:                  charge the recorded cost -> replay
+```
+
+- **Exact match, not semantic.** A semantic tier needs an embedding call on
+  every request — including misses — turning a latency win into a guaranteed
+  latency cost, and it can confidently return the answer to a *different*
+  question. Exact match has neither problem. `cache.build_key` is the seam
+  where a semantic tier would be added later.
+- **A hit costs what a miss costs** (`CACHE_HIT_MODE=metered`). A free cache
+  would let a client repeat one prompt to farm unlimited output. The gateway
+  still saves the upstream call, which is the point.
+- **Per-API-key scope by default**, so one key's answers stay invisible to
+  another even when the prompts are identical.
+- **Failures are never cached.** A stream that ends without `[DONE]` was
+  truncated, so it is neither charged as final nor stored.
+- **Expired entries are invisible** — expiry is enforced in the lookup query
+  rather than by a sweeper.
+
+Measure it: `GET /cache/stats` reports hit rate, latency, and the tokens and
+credits served from cache.
+
+### Guardrails
+
+Two layers, because a prompt instruction is not access control:
+
+1. **Prompt** — a persona that never names its own model, provider, or
+   infrastructure, refuses extraction attempts, and explicitly keeps answering
+   ordinary questions normally (the anti-over-refusal half of the problem).
+2. **Filter** — every token passes through a redactor before it reaches the
+   client *or the cache*, covering credentials, connection strings, and
+   self-referential identity claims. The terms come from the configured model
+   chain, so changing the chain changes what gets suppressed.
+
+The filter is streaming-safe: it holds back only the trailing window where a
+match could still be forming, and `verify_cache.py` proves completeness across
+every possible chunk seam. Upstream errors are mapped to generic messages, so
+provider names and request bodies never reach a client.
+
+What it is **not**: a general safety filter, or a guarantee. A model can still
+describe itself obliquely or in another language. This is a real second layer,
+not a proof.
 
 ### Endpoints
 
@@ -161,6 +253,8 @@ reports (prompt + completion), rounded up, minimum 1.
 | `POST` | `/usage/record` | Metered demo; `Authorization: Bearer <key>` |
 | `POST` | `/chat` | Metered streaming chat (SSE); `Authorization: Bearer <key>` |
 | `POST` | `/credits/reclaim-expired` | Release expired reservations |
+| `GET` | `/cache/stats` | Hit rate, latency, tokens and credits served from cache |
+| `POST` | `/cache/cleanup` | Drop expired entries, enforce the size cap |
 
 Auth: `Authorization: Bearer <api-key>` → `401` invalid/revoked,
 `402` insufficient credits, `403` expired credits.
@@ -184,6 +278,7 @@ token on every message. With no key selected, chat requests are rejected with
 .venv/bin/python -m uvicorn miniLLMBE.main:app &      # backend on :8000
 .venv/bin/python scripts/verify_credits.py             # 57 checks
 .venv/bin/python scripts/verify_chat.py                # 48 checks
+.venv/bin/python scripts/verify_cache.py               # 78 checks
 ```
 
 The credit suite covers the balance invariant, TTL expiry and revival,
@@ -198,6 +293,65 @@ metering, partial settlement of the reservation, estimated usage when the
 provider reports none, the rejection paths (402/403/401/422), a fully
 rate-limited chain, a client hanging up mid-stream, and chat disabled.
 
+`verify_cache.py` does the same for caching and guardrails: hits and misses,
+normalization, per-key isolation, TTL expiry, bypass, billing, failed
+generations, 12-way concurrency, and the redactor's completeness across every
+chunk seam. It defaults to a private SQLite database; pass `--dsn=<url>` to
+run against the real engine (it cleans up the rows it creates).
+
+## Deployment
+
+This is **two services**, and they must both be running for chat to work:
+
+| Service | What | Where it can run |
+| --- | --- | --- |
+| `miniLLMFE` | Next.js UI + `/api/*` passthrough | Vercel, or any Node host |
+| `miniLLMBE` | FastAPI: credits, chat, cache | Any Python host |
+
+The frontend never talks to the database or Groq directly; it forwards
+`/api/*` to the backend, so `BACKEND_URL` is the only wiring between them.
+
+### Frontend (Vercel)
+
+```bash
+cd miniLLMFE
+vercel link                                   # project name: miniLLM
+vercel env add BACKEND_URL production         # the backend's public URL
+vercel env add NEXT_PUBLIC_API_URL production # shown in the usage snippet
+vercel --prod
+```
+
+`OPENAI_API_KEY` in the starter `.env.example` is vestigial and can be ignored —
+the frontend proxies, it does not call a model.
+
+### Backend
+
+Run it as a long-lived Python process (it holds streaming connections open):
+
+```bash
+.venv/bin/python -m uvicorn miniLLMBE.main:app --host 0.0.0.0 --port 8000
+```
+
+Required environment: `DATABASE_URL` (use the **pooled** endpoint), and
+`GROQ_API_KEY`. CORS must list the frontend origin in `CORS_ORIGINS`.
+
+Serverless platforms are a poor fit without adjustment: the app streams for as
+long as the model takes, and the process-local caches (hit counters, eviction
+and reclaim throttles) reset on every cold start — they are optimisations, so
+nothing breaks, but the counters do.
+
+## Operations
+
+- `GET /cache/stats` — hit rate, average latency per path, tokens and credits
+  served from cache. The counters are per process; the request log line is the
+  durable signal.
+- `POST /cache/cleanup` — drop expired entries and enforce `CACHE_MAX_ENTRIES`.
+  Worth scheduling; the request path only sweeps every
+  `CACHE_EVICT_EVERY` writes, by design, to keep the write path cheap.
+- Credit moves are all in `credit_ledger`. `spent` and `available` must always
+  reconcile; if they ever diverge, the ledger is the source of truth.
+- `scripts/bench_db.py "<dsn>"` before changing database region.
+
 ## Migration note
 
 There is no migration tooling yet. `init_db()` only creates *missing* tables, so
@@ -207,15 +361,26 @@ Adding Alembic is the natural next step.
 
 ## Known gaps
 
+- **Guardrails are a second layer, not a proof.** The persona is an instruction
+  and the redactor is a pattern list; neither is access control. A model can
+  still describe itself obliquely or in another language.
 - The chat UI keeps the plaintext keys you opt into in **browser
   localStorage** (`lib/chat-key-store.ts`). The backend only stores a hash, so
   the alternative is pasting a key on every message. Keys stay in your browser;
   they are sent only as the `Authorization` header on chat requests.
 - Chat streams **text only**. Image/file attachments and tool calls in the
   composer are dropped before the request reaches the model.
-- The `/keys` endpoints are unauthenticated — they assume a trusted operator.
-  Only the metered `/usage/record` and `/chat` paths enforce a bearer token.
-- `verify_key` does a read plus a `last_used_at` write on every call; fine at
-  this scale, worth batching if it becomes hot.
+- The `/keys` and `/cache/*` endpoints are unauthenticated — they assume a
+  trusted operator. Only the metered `/usage/record` and `/chat` paths enforce
+  a bearer token. **Do not expose the backend to the public internet as-is**;
+  put it behind whatever fronts your operator-only endpoints.
+- Cache counters, eviction state, and reclaim throttles are per-process, so on
+  a multi-process or serverless deployment they reset on restart and are not
+  consistent across workers. The request log line is the durable signal.
+- The cache write still happens on the request path (2 round trips). Moving it
+  to a background task would take it off the critical path; billing settlement
+  must stay synchronous either way.
 - Mid-stream failures charge an **estimated** cost, since the provider never
   reported final usage for a stream that died.
+- The app exits silently if its port is already bound, which makes a stale
+  process easy to mistake for the new one. Worth a loud failure.

@@ -92,6 +92,9 @@ class _StreamState:
     text: list[str] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
     finish_reason: str | None = None
+    # True once the provider closed the stream properly. A stream that ends
+    # without this was truncated, and its answer is incomplete.
+    completed: bool = False
 
     def estimated_usage(self, prompt_messages: list[dict]) -> Usage:
         """Fallback metering when the provider reports no usage."""
@@ -204,7 +207,10 @@ def normalize_messages(
     if system_prompt:
         flattened.insert(0, {"role": "system", "content": system_prompt})
 
-    if not flattened:
+    # "No usable text" means no *conversation* text. A system prompt alone (the
+    # persona, possibly plus nothing) is not a request: sending it would bill
+    # the caller for a message they never made.
+    if not any(message["role"] != "system" for message in flattened):
         raise ValueError("no text messages to send to the model")
     return flattened
 
@@ -339,6 +345,8 @@ async def _stream_model(
             if not data:
                 continue
             if data == "[DONE]":
+                # The provider closed the stream cleanly: this answer is whole.
+                state.completed = True
                 break
             try:
                 chunk = json.loads(data)
@@ -382,6 +390,18 @@ async def _stream_model(
                     yield text
                 if choice.get("finish_reason"):
                     state.finish_reason = choice.get("finish_reason")
+
+    if not state.completed:
+        # No `[DONE]` and no finish reason: the provider dropped the stream
+        # mid-answer. Charging or caching this would record a truncated answer
+        # as final, so treat it as a failure. Not retryable: the partial text is
+        # already on the wire, so switching models would splice two answers.
+        raise LLMError(
+            f"{model} closed the stream without completing the response",
+            status_code=502,
+            retryable=False,
+            model=model,
+        )
 
 
 async def stream_with_fallback(
